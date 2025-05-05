@@ -1,0 +1,998 @@
+import pygame
+import random
+import numpy as np
+import sys
+import pickle
+import os
+import matplotlib.pyplot as plt
+from collections import defaultdict, deque
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+# Constants
+GRID_WIDTH, GRID_HEIGHT = 20, 20
+CELL_SIZE = 20
+WIDTH, HEIGHT = GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE
+MAX_EPISODES = 1000
+MAX_STEPS_PER_EPISODE = 1000
+OBSTACLE_COUNT = 10
+FPS_TRAINING = 60
+FPS_PLAYING = 10
+SNAKE_START_RANGE = (5, 15)  # Range for random start position
+
+# Pygame init
+pygame.init()
+SCREEN = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Neural Snake")
+FONT = pygame.font.SysFont("Arial", 20)
+
+# Colors
+WHITE = (255, 255, 255)
+GREEN = (0, 255, 0)
+RED = (255, 0, 0)
+BLACK = (0, 0, 0)
+BLUE = (0, 100, 255)
+GRAY = (100, 100, 100)
+YELLOW = (255, 255, 0)  # For game over message
+PURPLE = (180, 0, 255)  # For neural network mode
+
+# RL Params
+ACTIONS = ['straight', 'left', 'right']
+DIRECTIONS = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # Up, Right, Down, Left
+DIRECTION_NAMES = ["UP", "RIGHT", "DOWN", "LEFT"]
+
+# Neural Network Params
+INPUT_SIZE = 11  # State features
+HIDDEN_SIZE = 256
+OUTPUT_SIZE = len(ACTIONS)
+LEARNING_RATE = 0.001
+BATCH_SIZE = 64
+MEMORY_SIZE = 10000
+GAMMA = 0.99  # Discount factor
+EPSILON_START = 1.0
+EPSILON_MIN = 0.01
+EPSILON_DECAY = 0.995
+UPDATE_TARGET_EVERY = 5  # Episodes between target network updates
+RANDOM_ACTION_CHANCE = 0.05  # For AI play mode
+
+# Vision distance
+VISION_DISTANCE = 5  # How far the snake can "see"
+
+
+# Define the Neural Network
+class DQN(nn.Module):
+    def __init__(self):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(INPUT_SIZE, HIDDEN_SIZE)
+        self.fc2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+        self.fc3 = nn.Linear(HIDDEN_SIZE, OUTPUT_SIZE)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+# Experience Replay Buffer
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        return (np.array(state), np.array(action), np.array(reward),
+                np.array(next_state), np.array(done))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# Agent class
+class DQNAgent:
+    def __init__(self):
+        self.policy_net = DQN()
+        self.target_net = DQN()
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()  # Set target network to evaluation mode
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
+        self.memory = ReplayBuffer(MEMORY_SIZE)
+        self.epsilon = EPSILON_START
+
+    def select_action(self, state, training=True):
+        # Epsilon-greedy policy
+        if training and random.random() < self.epsilon:
+            return random.randint(0, OUTPUT_SIZE - 1)
+        else:
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                q_values = self.policy_net(state_tensor)
+                return torch.argmax(q_values).item()
+
+    def update_model(self):
+        if len(self.memory) < BATCH_SIZE:
+            return 0.0  # Not enough samples
+
+        # Sample batch
+        states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
+
+        # Convert to tensors
+        states_tensor = torch.FloatTensor(states)
+        actions_tensor = torch.LongTensor(actions)
+        rewards_tensor = torch.FloatTensor(rewards)
+        next_states_tensor = torch.FloatTensor(next_states)
+        dones_tensor = torch.FloatTensor(dones)
+
+        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken
+        state_action_values = self.policy_net(states_tensor).gather(1, actions_tensor.unsqueeze(-1))
+
+        # Compute V(s_{t+1}) for all next states
+        next_state_values = torch.zeros(BATCH_SIZE)
+        with torch.no_grad():
+            next_state_values = self.target_net(next_states_tensor).max(1)[0]
+
+        # Compute the expected Q values
+        expected_state_action_values = rewards_tensor + (GAMMA * next_state_values * (1 - dones_tensor))
+
+        # Compute loss
+        loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        # Clip gradients to help with training stability
+        for param in self.policy_net.parameters():
+            param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+
+        return loss.item()
+
+    def update_target_network(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    def decay_epsilon(self):
+        self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
+
+    def save_model(self, filepath="snake_dqn.pth"):
+        torch.save({
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'target_net_state_dict': self.target_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon
+        }, filepath)
+        print(f"Model saved to {filepath}")
+
+    def load_model(self, filepath="snake_dqn.pth"):
+        if os.path.exists(filepath):
+            checkpoint = torch.load(filepath)
+            self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+            self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.epsilon = checkpoint['epsilon']
+            print(f"Model loaded from {filepath}")
+            return True
+        else:
+            print("No model found, starting fresh")
+            return False
+
+
+def draw(snake, food, score, obstacles, game_over=False, message="", mode="QLEARN"):
+    """Draw the game state to the screen"""
+    SCREEN.fill(BLACK)
+
+    # Draw obstacles
+    for obs in obstacles:
+        pygame.draw.rect(SCREEN, GRAY, (obs[0] * CELL_SIZE, obs[1] * CELL_SIZE, CELL_SIZE, CELL_SIZE))
+
+    # Draw snake
+    for i, (x, y) in enumerate(snake):
+        color = BLUE if i == 0 else GREEN
+        if mode == "NEURAL":
+            color = PURPLE if i == 0 else GREEN
+        pygame.draw.rect(SCREEN, color, (x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE))
+
+    # Draw food
+    pygame.draw.rect(SCREEN, RED, (food[0] * CELL_SIZE, food[1] * CELL_SIZE, CELL_SIZE, CELL_SIZE))
+
+    # Draw score
+    text = FONT.render(f"Score: {score} | Mode: {mode}", True, WHITE)
+    SCREEN.blit(text, (10, 10))
+
+    # Draw game over message if applicable
+    if game_over:
+        text = FONT.render(message, True, YELLOW)
+        text_rect = text.get_rect(center=(WIDTH // 2, HEIGHT // 2))
+        SCREEN.blit(text, text_rect)
+
+        # Instructions for restart
+        restart_text = FONT.render("Press R to restart or Q to quit", True, WHITE)
+        restart_rect = restart_text.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 30))
+        SCREEN.blit(restart_text, restart_rect)
+
+    pygame.display.flip()
+
+
+def turn(direction_idx, action):
+    """Apply an action to change direction"""
+    if action == 'left': return (direction_idx - 1) % 4
+    if action == 'right': return (direction_idx + 1) % 4
+    return direction_idx
+
+
+def move(pos, direction_idx):
+    """Move in the current direction"""
+    dx, dy = DIRECTIONS[direction_idx]
+    return (pos[0] + dx, pos[1] + dy)
+
+
+def is_collision(pos, snake, obstacles):
+    """Check if position collides with snake, obstacles or walls"""
+    # Wall collision
+    if not (0 <= pos[0] < GRID_WIDTH and 0 <= pos[1] < GRID_HEIGHT):
+        return True
+    # Snake collision (except tail which will move)
+    if pos in snake[:-1]:
+        return True
+    # Obstacle collision
+    if pos in obstacles:
+        return True
+    return False
+
+
+def get_state_neural(snake, food, direction_idx, obstacles):
+    """Create a state representation for the neural network"""
+    head = snake[0]
+
+    # Check for immediate dangers (adjacent cells)
+    straight_pos = move(head, direction_idx)
+    left_dir = turn(direction_idx, 'left')
+    right_dir = turn(direction_idx, 'right')
+    left_pos = move(head, left_dir)
+    right_pos = move(head, right_dir)
+
+    danger_straight = 1.0 if is_collision(straight_pos, snake, obstacles) else 0.0
+    danger_left = 1.0 if is_collision(left_pos, snake, obstacles) else 0.0
+    danger_right = 1.0 if is_collision(right_pos, snake, obstacles) else 0.0
+
+    # Determine food direction
+    # This creates 8 possible food directions (N, NE, E, SE, S, SW, W, NW)
+    rel_x = food[0] - head[0]
+    rel_y = food[1] - head[1]
+
+    # Normalize to -1, 0, 1 for each direction
+    if rel_x > 0:
+        rel_x = 1.0
+    elif rel_x < 0:
+        rel_x = -1.0
+    else:
+        rel_x = 0.0
+
+    if rel_y > 0:
+        rel_y = 1.0
+    elif rel_y < 0:
+        rel_y = -1.0
+    else:
+        rel_y = 0.0
+
+    # Check food distance (normalized)
+    food_dist_x = min(abs(food[0] - head[0]), VISION_DISTANCE) / VISION_DISTANCE
+    food_dist_y = min(abs(food[1] - head[1]), VISION_DISTANCE) / VISION_DISTANCE
+
+    # Current direction (one-hot encoding)
+    dir_up = 1.0 if direction_idx == 0 else 0.0
+    dir_right = 1.0 if direction_idx == 1 else 0.0
+    dir_down = 1.0 if direction_idx == 2 else 0.0
+    dir_left = 1.0 if direction_idx == 3 else 0.0
+
+    # Combine all state components
+    state = np.array([
+        danger_straight, danger_left, danger_right,
+        dir_up, dir_right, dir_down, dir_left,
+        food_dist_x, food_dist_y,
+        rel_x, rel_y
+    ], dtype=np.float32)
+
+    return state
+
+
+def get_state(snake, food, direction_idx, obstacles):
+    """Create a more detailed state representation for Q-learning"""
+    head = snake[0]
+
+    # Check for immediate dangers (adjacent cells)
+    straight_pos = move(head, direction_idx)
+    left_dir = turn(direction_idx, 'left')
+    right_dir = turn(direction_idx, 'right')
+    left_pos = move(head, left_dir)
+    right_pos = move(head, right_dir)
+
+    danger_straight = is_collision(straight_pos, snake, obstacles)
+    danger_left = is_collision(left_pos, snake, obstacles)
+    danger_right = is_collision(right_pos, snake, obstacles)
+
+    # Determine food direction
+    # This creates 8 possible food directions (N, NE, E, SE, S, SW, W, NW)
+    rel_x = food[0] - head[0]
+    rel_y = food[1] - head[1]
+
+    # Normalize to -1, 0, 1 for each direction
+    if rel_x > 0:
+        rel_x = 1
+    elif rel_x < 0:
+        rel_x = -1
+
+    if rel_y > 0:
+        rel_y = 1
+    elif rel_y < 0:
+        rel_y = -1
+
+    # Check food distance (limited to VISION_DISTANCE)
+    food_dist_x = min(abs(food[0] - head[0]), VISION_DISTANCE)
+    food_dist_y = min(abs(food[1] - head[1]), VISION_DISTANCE)
+
+    # Current direction
+    dir_up = 1 if direction_idx == 0 else 0
+    dir_right = 1 if direction_idx == 1 else 0
+    dir_down = 1 if direction_idx == 2 else 0
+    dir_left = 1 if direction_idx == 3 else 0
+
+    # Combine all state components
+    state = (
+        danger_straight, danger_left, danger_right,
+        rel_x, rel_y,
+        dir_up, dir_right, dir_down, dir_left
+    )
+
+    return state
+
+
+def place_food(snake, obstacles):
+    """Place food in an empty cell"""
+    empty_cells = []
+    for x in range(GRID_WIDTH):
+        for y in range(GRID_HEIGHT):
+            pos = (x, y)
+            if pos not in snake and pos not in obstacles:
+                empty_cells.append(pos)
+
+    if not empty_cells:  # If no empty cells (very rare)
+        return None
+
+    return random.choice(empty_cells)
+
+
+def place_obstacles(num=OBSTACLE_COUNT):
+    """Place obstacles randomly but not too close to center"""
+    obstacles = []
+    center = (GRID_WIDTH // 2, GRID_HEIGHT // 2)
+
+    for _ in range(num):
+        while True:
+            pos = (random.randint(0, GRID_WIDTH - 1), random.randint(0, GRID_HEIGHT - 1))
+            distance_to_center = abs(pos[0] - center[0]) + abs(pos[1] - center[1])
+
+            # Ensure obstacles aren't too close to center
+            if distance_to_center > 3 and pos not in obstacles:
+                obstacles.append(pos)
+                break
+
+    return obstacles
+
+
+def save_qtable(q_table):
+    """Save Q-table to file"""
+    # Convert defaultdict to regular dict for saving
+    dict_qtable = dict(q_table)
+    with open("q_table.pkl", "wb") as f:
+        pickle.dump(dict_qtable, f)
+    print(f"Q-table saved with {len(dict_qtable)} states")
+
+
+def load_qtable():
+    """Load Q-table from file"""
+    if os.path.exists("q_table.pkl"):
+        with open("q_table.pkl", "rb") as f:
+            loaded_dict = pickle.load(f)
+            # Convert back to defaultdict
+            q_table = defaultdict(lambda: np.zeros(len(ACTIONS)), loaded_dict)
+        print(f"Q-table loaded with {len(q_table)} states")
+        return q_table
+    else:
+        print("No Q-table found, starting fresh")
+        return defaultdict(lambda: np.zeros(len(ACTIONS)))
+
+
+def get_reward(new_head, snake, food, collision):
+    """Calculate reward for current action"""
+    if collision:
+        return -10  # Penalty for collisions
+
+    if new_head == food:
+        return 10  # Reward for eating food
+
+    # Small penalty for each move to encourage efficient paths
+    # Calculate if we're getting closer to food
+    head = snake[0]
+    prev_dist = abs(head[0] - food[0]) + abs(head[1] - food[1])
+    new_dist = abs(new_head[0] - food[0]) + abs(new_head[1] - food[1])
+
+    if new_dist < prev_dist:
+        return 0.1  # Small reward for moving closer to food
+    else:
+        return -0.1  # Small penalty for moving away from food
+
+
+def train_neural_snake(episodes=MAX_EPISODES, visualize=False):
+    """Train the snake using Deep Q-Learning"""
+    agent = DQNAgent()
+    scores = []
+    max_score = 0
+    clock = pygame.time.Clock()
+    losses = []
+    avg_losses = []
+
+    print("Starting Neural Network training...")
+
+    for episode in range(1, episodes + 1):
+        # Initialize snake with random start position
+        start_x = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+        start_y = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+        snake = [(start_x, start_y), (start_x - 1, start_y)]
+        direction_idx = 1  # Start moving right
+
+        obstacles = place_obstacles()
+        food = place_food(snake, obstacles)
+        score = 0
+        total_reward = 0
+        episode_loss = 0
+        steps = 0
+
+        for step in range(MAX_STEPS_PER_EPISODE):
+            pygame.event.pump()  # Keep pygame responding
+
+            # Check for quit events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    agent.save_model()
+                    pygame.quit()
+                    sys.exit()
+
+            # Get current state
+            state = get_state_neural(snake, food, direction_idx, obstacles)
+
+            # Choose action
+            action_idx = agent.select_action(state)
+
+            # Apply action
+            new_direction_idx = turn(direction_idx, ACTIONS[action_idx])
+            new_head = move(snake[0], new_direction_idx)
+
+            # Check for collision
+            collision = is_collision(new_head, snake, obstacles)
+            done = collision
+
+            # Calculate reward
+            reward = get_reward(new_head, snake, food, collision)
+            total_reward += reward
+
+            # Update snake position if no collision
+            if not collision:
+                snake.insert(0, new_head)
+
+                # Check if food eaten
+                if new_head == food:
+                    score += 1
+                    if score > max_score:
+                        max_score = score
+                    food = place_food(snake, obstacles)
+                else:
+                    snake.pop()  # Remove tail if no food eaten
+
+                # Get new state
+                next_state = get_state_neural(snake, food, new_direction_idx, obstacles)
+
+                # Store transition in memory
+                agent.memory.push(state, action_idx, reward, next_state, done)
+
+                # Update neural network
+                step_loss = agent.update_model()
+                if step_loss > 0:
+                    episode_loss += step_loss
+                    steps += 1
+
+                # Update direction
+                direction_idx = new_direction_idx
+
+                # Visualize if requested
+                if visualize and step % 2 == 0:  # Only render every other step to speed up training
+                    draw(snake, food, score, obstacles, mode="NEURAL")
+                    clock.tick(FPS_TRAINING)
+            else:
+                # Store terminal state transition
+                next_state = get_state_neural(snake, food, new_direction_idx, obstacles)
+                agent.memory.push(state, action_idx, reward, next_state, done)
+                break
+
+        # Update target network periodically
+        if episode % UPDATE_TARGET_EVERY == 0:
+            agent.update_target_network()
+
+        # Decay epsilon
+        agent.decay_epsilon()
+        scores.append(score)
+
+        # Calculate average loss for the episode
+        avg_episode_loss = episode_loss / max(1, steps)
+        losses.append(avg_episode_loss)
+
+        # Progress updates
+        if episode % 20 == 0:
+            avg_score = sum(scores[-20:]) / min(20, len(scores[-20:]))
+            avg_loss = sum(losses[-20:]) / min(20, len(losses[-20:]))
+            avg_losses.append(avg_loss)
+            print(f"Episode {episode:4d} | Score: {score:2d} | Avg Score: {avg_score:.2f} | "
+                  f"Max Score: {max_score:2d} | Epsilon: {agent.epsilon:.4f} | Loss: {avg_loss:.4f}")
+
+        # Save model periodically
+        if episode % 100 == 0:
+            agent.save_model()
+
+    # Save final model and plot training progress
+    agent.save_model()
+
+    # Plot training progress
+    plt.figure(figsize=(15, 6))
+
+    # Plot episode scores
+    plt.subplot(1, 3, 1)
+    plt.plot(scores)
+    plt.title("Training Scores")
+    plt.xlabel("Episode")
+    plt.ylabel("Score")
+
+    # Plot moving average
+    plt.subplot(1, 3, 2)
+    moving_avg = []
+    window_size = 100
+    for i in range(len(scores) - window_size + 1):
+        moving_avg.append(sum(scores[i:i + window_size]) / window_size)
+    plt.plot(moving_avg)
+    plt.title(f"Moving Average Score (Window Size: {window_size})")
+    plt.xlabel("Episode")
+    plt.ylabel("Average Score")
+
+    # Plot average loss
+    plt.subplot(1, 3, 3)
+    plt.plot(avg_losses)
+    plt.title("Average Loss")
+    plt.xlabel("20-Episode Intervals")
+    plt.ylabel("Loss")
+
+    plt.tight_layout()
+    plt.savefig("neural_training_scores.png")
+    plt.close()
+
+
+def train_snake(episodes=MAX_EPISODES, visualize=False):
+    """Train the snake using Q-learning"""
+    q_table = defaultdict(lambda: np.zeros(len(ACTIONS)))
+    epsilon = INITIAL_EPSILON = 1.0
+    MIN_EPSILON = 0.01
+    EPSILON_DECAY = 0.995
+    LEARNING_RATE = 0.1
+    DISCOUNT_FACTOR = 0.9
+
+    scores = []
+    max_score = 0
+    clock = pygame.time.Clock()
+
+    for episode in range(1, episodes + 1):
+        # Initialize snake with random start position
+        start_x = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+        start_y = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+        snake = [(start_x, start_y), (start_x - 1, start_y)]
+        direction_idx = 1  # Start moving right
+
+        obstacles = place_obstacles()
+        food = place_food(snake, obstacles)
+        score = 0
+        total_reward = 0
+
+        for step in range(MAX_STEPS_PER_EPISODE):
+            pygame.event.pump()  # Keep pygame responding
+
+            # Check for quit events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    save_qtable(q_table)
+                    pygame.quit()
+                    sys.exit()
+
+            # Get current state
+            state = get_state(snake, food, direction_idx, obstacles)
+
+            # Choose action (epsilon-greedy policy)
+            if random.random() < epsilon:
+                action_idx = random.randint(0, len(ACTIONS) - 1)  # Explore
+            else:
+                action_idx = np.argmax(q_table[state])  # Exploit
+
+            # Apply action
+            new_direction_idx = turn(direction_idx, ACTIONS[action_idx])
+            new_head = move(snake[0], new_direction_idx)
+
+            # Check for collision
+            collision = is_collision(new_head, snake, obstacles)
+
+            # Calculate reward
+            reward = get_reward(new_head, snake, food, collision)
+            total_reward += reward
+
+            # Update snake position if no collision
+            if not collision:
+                snake.insert(0, new_head)
+
+                # Check if food eaten
+                if new_head == food:
+                    score += 1
+                    if score > max_score:
+                        max_score = score
+                    food = place_food(snake, obstacles)
+                else:
+                    snake.pop()  # Remove tail if no food eaten
+
+                # Get new state
+                new_state = get_state(snake, food, new_direction_idx, obstacles)
+
+                # Update Q-table (Q-learning formula)
+                q_table[state][action_idx] += LEARNING_RATE * (
+                        reward + DISCOUNT_FACTOR * np.max(q_table[new_state]) - q_table[state][action_idx]
+                )
+
+                # Update direction
+                direction_idx = new_direction_idx
+
+                # Visualize if requested
+                if visualize and step % 2 == 0:  # Only render every other step to speed up training
+                    draw(snake, food, score, obstacles, mode="QLEARN")
+                    clock.tick(FPS_TRAINING)
+            else:
+                # Update Q-table for terminal state
+                q_table[state][action_idx] += LEARNING_RATE * (reward - q_table[state][action_idx])
+                break
+
+        # Decay epsilon
+        epsilon = max(MIN_EPSILON, epsilon * EPSILON_DECAY)
+        scores.append(score)
+
+        # Progress updates
+        if episode % 50 == 0:
+            avg_score = sum(scores[-50:]) / min(50, len(scores[-50:]))
+            print(f"Episode {episode:4d} | Score: {score:2d} | Avg Score: {avg_score:.2f} | "
+                  f"Max Score: {max_score:2d} | Epsilon: {epsilon:.4f} | "
+                  f"Q-table size: {len(q_table)}")
+
+    # Save Q-table and plot training progress
+    save_qtable(q_table)
+
+    # Plot training progress
+    plt.figure(figsize=(12, 6))
+
+    # Plot episode scores
+    plt.subplot(1, 2, 1)
+    plt.plot(scores)
+    plt.title("Training Scores")
+    plt.xlabel("Episode")
+    plt.ylabel("Score")
+
+    # Plot moving average
+    plt.subplot(1, 2, 2)
+    moving_avg = []
+    window_size = 100
+    for i in range(len(scores) - window_size + 1):
+        moving_avg.append(sum(scores[i:i + window_size]) / window_size)
+    plt.plot(moving_avg)
+    plt.title(f"Moving Average (Window Size: {window_size})")
+    plt.xlabel("Episode")
+    plt.ylabel("Average Score")
+
+    plt.tight_layout()
+    plt.savefig("training_scores.png")
+    plt.close()
+
+    return q_table
+
+
+def play_neural_snake():
+    """Play the game using the trained neural network"""
+    agent = DQNAgent()
+    if not agent.load_model():
+        print("No trained model found. Please train the neural network first.")
+        return
+
+    # Initialize snake with random start position
+    start_x = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+    start_y = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+    snake = [(start_x, start_y), (start_x - 1, start_y)]
+    direction_idx = 1  # Start moving right
+
+    obstacles = place_obstacles()
+    food = place_food(snake, obstacles)
+    clock = pygame.time.Clock()
+    score = 0
+    steps = 0
+    game_over = False
+
+    while True:
+        pygame.event.pump()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r and game_over:
+                    return play_neural_snake()  # Restart game
+                elif event.key == pygame.K_q:
+                    pygame.quit()
+                    return
+
+        if not game_over:
+            # Get current state
+            state = get_state_neural(snake, food, direction_idx, obstacles)
+
+            # Choose action with a small chance of random action
+            if random.random() < RANDOM_ACTION_CHANCE:
+                action_idx = random.randint(0, len(ACTIONS) - 1)
+            else:
+                action_idx = agent.select_action(state, training=False)
+
+            # Apply action
+            direction_idx = turn(direction_idx, ACTIONS[action_idx])
+            new_head = move(snake[0], direction_idx)
+
+            # Check for collision
+            if is_collision(new_head, snake, obstacles):
+                game_over = True
+                message = f"Game Over! Final Score: {score} | Steps: {steps}"
+                draw(snake, food, score, obstacles, game_over, message, mode="NEURAL")
+                continue
+
+            # Update snake position
+            snake.insert(0, new_head)
+
+            # Check if food eaten
+            if new_head == food:
+                score += 1
+                food = place_food(snake, obstacles)
+            else:
+                snake.pop()  # Remove tail if no food eaten
+
+            steps += 1
+
+        # Draw game state
+        draw(snake, food, score, obstacles, game_over, mode="NEURAL")
+        clock.tick(FPS_PLAYING)
+
+
+def play_qlearn_snake():
+    """Play the game using the trained Q-learning model"""
+    q_table = load_qtable()
+
+    # Initialize snake with random start position
+    start_x = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+    start_y = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+    snake = [(start_x, start_y), (start_x - 1, start_y)]
+    direction_idx = 1  # Start moving right
+
+    obstacles = place_obstacles()
+    food = place_food(snake, obstacles)
+    clock = pygame.time.Clock()
+    score = 0
+    steps = 0
+    game_over = False
+
+    while True:
+        pygame.event.pump()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r and game_over:
+                    return play_qlearn_snake()  # Restart game
+                elif event.key == pygame.K_q:
+                    pygame.quit()
+                    return
+
+        if not game_over:
+            # Get current state
+            state = get_state(snake, food, direction_idx, obstacles)
+
+            # Choose action with a small chance of random action
+            if random.random() < RANDOM_ACTION_CHANCE:
+                action_idx = random.randint(0, len(ACTIONS) - 1)
+            else:
+                action_idx = np.argmax(q_table[state])
+
+            # Apply action
+            direction_idx = turn(direction_idx, ACTIONS[action_idx])
+            new_head = move(snake[0], direction_idx)
+
+            # Check for collision
+            if is_collision(new_head, snake, obstacles):
+                game_over = True
+                message = f"Game Over! Final Score: {score} | Steps: {steps}"
+                draw(snake, food, score, obstacles, game_over, message, mode="QLEARN")
+                continue
+
+            # Update snake position
+            snake.insert(0, new_head)
+
+            # Check if food eaten
+            if new_head == food:
+                score += 1
+                food = place_food(snake, obstacles)
+            else:
+                snake.pop()  # Remove tail if no food eaten
+
+            steps += 1
+
+        # Draw game state
+        draw(snake, food, score, obstacles, game_over, mode="QLEARN")
+        clock.tick(FPS_PLAYING)
+
+
+def play_human_snake():
+    """Play the game with human controls"""
+    # Initialize snake with random start position
+    start_x = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+    start_y = random.randint(SNAKE_START_RANGE[0], SNAKE_START_RANGE[1])
+    snake = [(start_x, start_y), (start_x - 1, start_y)]
+    direction_idx = 1  # Start moving right
+
+    obstacles = place_obstacles()
+    food = place_food(snake, obstacles)
+    clock = pygame.time.Clock()
+    score = 0
+    steps = 0
+    game_over = False
+
+    while True:
+        pygame.event.pump()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r and game_over:
+                    return play_human_snake()  # Restart game
+                elif event.key == pygame.K_q:
+                    pygame.quit()
+                    return
+                elif not game_over:
+                    # Human controls
+                    if event.key == pygame.K_UP and direction_idx != 2:  # Not going down
+                        direction_idx = 0  # Up
+                    elif event.key == pygame.K_RIGHT and direction_idx != 3:  # Not going left
+                        direction_idx = 1  # Right
+                    elif event.key == pygame.K_DOWN and direction_idx != 0:  # Not going up
+                        direction_idx = 2  # Down
+                    elif event.key == pygame.K_LEFT and direction_idx != 1:  # Not going right
+                        direction_idx = 3  # Left
+
+        if not game_over:
+            # Move snake
+            new_head = move(snake[0], direction_idx)
+
+            # Check for collision
+            if is_collision(new_head, snake, obstacles):
+                game_over = True
+                message = f"Game Over! Final Score: {score} | Steps: {steps}"
+                draw(snake, food, score, obstacles, game_over, message, mode="HUMAN")
+                continue
+
+            # Update snake position
+            snake.insert(0, new_head)
+
+            # Check if food eaten
+            if new_head == food:
+                score += 1
+                food = place_food(snake, obstacles)
+            else:
+                snake.pop()  # Remove tail if no food eaten
+
+            steps += 1
+
+        # Draw game state
+        draw(snake, food, score, obstacles, game_over, mode="HUMAN")
+        clock.tick(FPS_PLAYING)
+
+
+def display_menu():
+    """Display a menu to choose game mode"""
+    SCREEN.fill(BLACK)
+
+    # Title
+    title_font = pygame.font.SysFont("Arial", 36)
+    title = title_font.render("Neural Snake Game", True, WHITE)
+    title_rect = title.get_rect(center=(WIDTH // 2, HEIGHT // 4))
+    SCREEN.blit(title, title_rect)
+
+    # Menu options
+    options = [
+        "1. Play (Human Controls)",
+        "2. Watch AI (Q-Learning)",
+        "3. Watch AI (Neural Network)",
+        "4. Train AI (Q-Learning)",
+        "5. Train AI (Neural Network)",
+        "6. Quit"
+    ]
+
+    menu_font = pygame.font.SysFont("Arial", 24)
+
+    for i, option in enumerate(options):
+        menu_item = menu_font.render(option, True, WHITE)
+        menu_rect = menu_item.get_rect(center=(WIDTH // 2, HEIGHT // 3 + i * 40))
+        SCREEN.blit(menu_item, menu_rect)
+
+    # Instructions
+    instr_font = pygame.font.SysFont("Arial", 18)
+    instr_text = instr_font.render("Press the number key to select an option", True, GRAY)
+    instr_rect = instr_text.get_rect(center=(WIDTH // 2, HEIGHT * 3 // 4))
+    SCREEN.blit(instr_text, instr_rect)
+
+    pygame.display.flip()
+
+
+def main():
+    """Main function to run the game"""
+    running = True
+
+    while running:
+        display_menu()
+
+        # Wait for user input
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_1:
+                        play_human_snake()
+                        waiting = False
+                    elif event.key == pygame.K_2:
+                        play_qlearn_snake()
+                        waiting = False
+                    elif event.key == pygame.K_3:
+                        play_neural_snake()
+                        waiting = False
+                    elif event.key == pygame.K_4:
+                        train_snake(visualize=True)
+                        waiting = False
+                    elif event.key == pygame.K_5:
+                        train_neural_snake(visualize=True)
+                        waiting = False
+                    elif event.key == pygame.K_6:
+                        running = False
+                        waiting = False
+                        pygame.quit()
+                        sys.exit()
+
+            clock = pygame.time.Clock()
+            clock.tick(FPS_PLAYING)
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
